@@ -1,0 +1,27 @@
+# Chat Memory — app/ dependencies
+# Install with: pip install -r requirements.txt
+
+# Web framework
+fastapi
+uvicorn[standard]
+
+# Config
+pydantic
+pydantic-settings
+
+# LangChain ecosystem
+langchain
+langgraph
+langchain-google-genai
+langchain-chroma
+langchain-huggingface
+
+# Vector store + embeddings
+chromadb
+sentence-transformers
+
+# File upload support
+python-multipart
+
+# Date parsing for relative date resolution
+dateparser

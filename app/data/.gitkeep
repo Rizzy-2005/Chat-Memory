@@ -1,0 +1,5 @@
+# This directory is intentionally empty at scaffold time.
+# It will hold:
+#   chroma/   — Chroma on-disk vector store
+#   dedup.db  — SQLite deduplication index
+# Both are gitignored; they live in the chat_data Docker named volume at runtime.
