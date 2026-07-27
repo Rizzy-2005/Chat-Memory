@@ -1,5 +1,15 @@
 """
-models.py — shared data models (Pydantic) used across the app.
-Stage 1: placeholder dataclasses; Stage 2 will flesh these out.
+models.py — shared Pydantic / dataclass models used across the app.
 """
-# TODO (Stage 2): define Message, SessionChunk, and any other domain models.
+from dataclasses import dataclass
+from datetime import datetime
+
+
+@dataclass
+class ParsedMessage:
+    """One WhatsApp message after parsing and hashing."""
+
+    timestamp: datetime   # parsed from the export header line
+    sender: str           # contact name exactly as it appears in the export
+    text: str             # full message body (multi-line messages joined with '\n')
+    content_hash: str     # sha256(f"{timestamp.isoformat()}|{sender}|{text}")
