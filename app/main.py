@@ -1,10 +1,10 @@
 """
 main.py — FastAPI application entry point.
-Creates the app instance and registers all four API routers.
+Creates the app instance and registers all API routers.
 """
 from fastapi import FastAPI
 
-from app.api import health, upload, query, summarize
+from app.api import debug, health, query, summarize, upload
 
 app = FastAPI(
     title="Chat Memory",
@@ -17,3 +17,4 @@ app.include_router(health.router, tags=["Health"])
 app.include_router(upload.router, tags=["Upload"])
 app.include_router(query.router, tags=["Query"])
 app.include_router(summarize.router, tags=["Summarize"])
+app.include_router(debug.router, tags=["Debug"])

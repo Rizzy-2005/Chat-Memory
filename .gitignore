@@ -6,12 +6,16 @@ __pycache__/
 venv/
 env/
 
+
 # Environment
 .env
 
 # App runtime data (lives in Docker named volume, not in git)
 app/data/chroma/
 app/data/dedup.db
+
+# WhatsApp export zips used for local testing — never commit real chat data!
+*.zip
 
 # Streamlit
 .streamlit/
