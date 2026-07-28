@@ -7,8 +7,17 @@ from pydantic import Field
 
 
 class Settings(BaseSettings):
-    # Google Gemini API key — required at runtime, no default.
-    gemini_api_key: str = Field(..., alias="GEMINI_API_KEY")
+    # Google Gemini API key (kept for reference, currently not used as active LLM).
+    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+
+    # Gemini model name (not used when Groq is the active provider).
+    gemini_model: str = Field(default="gemini-2.0-flash-lite", alias="GEMINI_MODEL")
+
+    # Groq API key — get a free key at console.groq.com
+    groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
+
+    # Groq model — llama-3.3-70b-versatile supports structured output reliably.
+    groq_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_MODEL")
 
     # Path where Chroma will persist its on-disk vector store.
     chroma_persist_dir: str = Field(
