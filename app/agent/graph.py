@@ -28,6 +28,7 @@ from app.agent.tools import (
     message_pinpoint,
     participant_filtered_lookup,
     plain_rag_lookup,
+    resolve_relative_dates_in_context,
 )
 from app.config import settings
 
@@ -180,11 +181,14 @@ def run_tool_node(state: AgentState) -> dict:
 
 def composer_node(state: AgentState) -> dict:
     """Turn raw retrieval results into a grounded, cited answer."""
+    raw_results = state.get("raw_results", "No context retrieved.")
+    date_info = resolve_relative_dates_in_context(raw_results)
+
     llm = _get_llm().with_structured_output(ComposerOutput)
     prompt = (
         f"{_COMPOSER_SYSTEM}\n\n"
         f"Tool used: {state.get('tool_name', 'unknown')}\n\n"
-        f"Retrieved context:\n{state.get('raw_results', 'No context retrieved.')}\n\n"
+        f"Retrieved context:\n{raw_results}{date_info}\n\n"
         f"Question: {state['question']}\n\n"
         "Produce your structured answer now."
     )
