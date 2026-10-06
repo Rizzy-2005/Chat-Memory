@@ -29,6 +29,7 @@ services:
     dockerContext: .
     plan: free
     envVars:
-      # The backend's public URL, e.g. https://chat-memory-api.onrender.com
+      # YOUR backend's public URL, copied from the chat-memory-api service page.
+      # Service names are global, so it often has a suffix: https://chat-memory-api-xxxx.onrender.com
       - key: BACKEND_URL
         sync: false

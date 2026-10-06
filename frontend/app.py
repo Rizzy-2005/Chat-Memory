@@ -48,6 +48,12 @@ def api(method: str, path: str, timeout: float = 30, **kwargs) -> dict:
         detail = resp.text
     if isinstance(detail, list):  # FastAPI validation errors
         detail = "; ".join(str(d.get("msg", d)) for d in detail)
+    if resp.status_code == 404 and path == "/stats":
+        raise BackendError(
+            f"The server at {BACKEND_URL} answered, but it isn't a Chat Memory backend. "
+            "Set BACKEND_URL to your own chat-memory-api URL (it may have a suffix, "
+            "e.g. https://chat-memory-api-xxxx.onrender.com)."
+        )
     if resp.status_code == 429:
         raise BackendError("The free AI quota is used up for now. Try again in a minute.")
     if resp.status_code == 503:
