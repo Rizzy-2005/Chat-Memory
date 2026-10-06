@@ -1,3 +1,14 @@
+---
+title: Chat Memory
+emoji: 💬
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 7860
+pinned: false
+short_description: Ask your WhatsApp chat anything, with cited answers
+---
+
 # Chat Memory
 
 **Chat Memory** lets you upload a WhatsApp chat export once and then ask questions
@@ -115,6 +126,24 @@ All settings live in `app/config.py` and are documented in `.env.example`. The m
 > If you upgrade from an older version, the backend notices the old storage format
 > on startup and resets the index. Re-upload your chat afterwards.
 
+## Deploying to Hugging Face Spaces (free, recommended)
+
+The root `Dockerfile` runs both halves in one container (FastAPI on 127.0.0.1:8000,
+Streamlit on the public port 7860). The YAML block at the top of this README is the
+Space configuration.
+
+1. Create a Space: **New Space → SDK: Docker → Blank**, hardware **CPU basic (free)**.
+2. In the Space's **Settings → Variables and secrets**, add the secret `GEMINI_API_KEY`
+   (and optionally `GROQ_API_KEY`).
+3. Push this repo to the Space:
+   ```bash
+   git remote add space https://huggingface.co/spaces/<your-username>/<space-name>
+   git push --force space main      # password = a Hugging Face token with write access
+   ```
+4. Wait for the build (~5–10 min the first time), then open the Space URL.
+
+Free Spaces sleep after ~48 h without visitors, and uploaded data is wiped on restart.
+
 ## Deploying to Render (free)
 
 1. Push to GitHub. `.env`, `*.zip` and `app/data/` are git-ignored.
@@ -122,7 +151,7 @@ All settings live in `app/config.py` and are documented in `.env.example`. The m
 3. Set `GEMINI_API_KEY` (and optionally `GROQ_API_KEY`) on **chat-memory-api**.
 4. Set `BACKEND_URL` on **chat-memory-ui** to the API's public URL, e.g. `https://chat-memory-api.onrender.com`.
 
-**Free-tier limits:**
+**Free-tier limits:** the backend needs ~480 MB, close to Render's 512 MB, so larger chats may crash it. Hugging Face Spaces (above) has far more memory.
 
 - The backend sleeps after about 15 minutes idle. The UI shows *"Waking the server"* and retries automatically.
 - There is no persistent disk, so uploads are lost when the backend restarts. The UI detects this and asks you to re-upload.
