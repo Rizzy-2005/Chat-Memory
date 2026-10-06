@@ -63,8 +63,17 @@ class MiniLMEmbeddings(Embeddings):
 
         self._fn = ONNXMiniLM_L6_V2()
 
+    # Chroma pads every text to 256 tokens and would embed 32 at once; the
+    # attention buffers for that (~100 MB per layer) get kept by onnxruntime
+    # and push a 512 MB instance over the limit.  Small slices keep the peak low.
+    _SLICE = 4
+
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return [[float(x) for x in v] for v in self._fn(list(texts))] if texts else []
+        texts = list(texts)
+        out: list[list[float]] = []
+        for i in range(0, len(texts), self._SLICE):
+            out.extend([float(x) for x in v] for v in self._fn(texts[i : i + self._SLICE]))
+        return out
 
     def embed_query(self, text: str) -> list[float]:
         return self.embed_documents([text])[0]
