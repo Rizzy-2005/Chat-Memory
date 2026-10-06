@@ -1,14 +1,3 @@
----
-title: Chat Memory
-emoji: 💬
-colorFrom: green
-colorTo: blue
-sdk: docker
-app_port: 7860
-pinned: false
-short_description: Ask your WhatsApp chat anything, with cited answers
----
-
 # Chat Memory
 
 **Chat Memory** lets you upload a WhatsApp chat export once and then ask questions
@@ -24,8 +13,8 @@ It's a RAG chatbot that:
 - **cites every claim** and refuses honestly when nothing relevant is found
 - **does date arithmetic deterministically**: "next Friday" in a message sent on 9 May is resolved by code, not by the LLM
 
-**Stack:** FastAPI · LangGraph · LangChain · Chroma · sentence-transformers
-(`all-MiniLM-L6-v2`, local) · Gemini free tier (with Groq as fallback) · SQLite ·
+**Stack:** FastAPI · LangGraph · LangChain · Chroma · all-MiniLM-L6-v2
+(`all-MiniLM-L6-v2`, local ONNX — no PyTorch) · Gemini free tier (with Groq as fallback) · SQLite ·
 Streamlit · Docker. Everything is free; no paid API is needed.
 
 ---
@@ -34,7 +23,7 @@ Streamlit · Docker. Everything is free; no paid API is needed.
 
 ```bash
 cp .env.example .env          # then paste your GEMINI_API_KEY (and optionally GROQ_API_KEY)
-docker compose up --build     # the first build is slow: torch + the embedding model
+docker compose up --build
 ```
 
 - UI: <http://localhost:8501>
@@ -126,24 +115,6 @@ All settings live in `app/config.py` and are documented in `.env.example`. The m
 > If you upgrade from an older version, the backend notices the old storage format
 > on startup and resets the index. Re-upload your chat afterwards.
 
-## Deploying to Hugging Face Spaces (free, recommended)
-
-The root `Dockerfile` runs both halves in one container (FastAPI on 127.0.0.1:8000,
-Streamlit on the public port 7860). The YAML block at the top of this README is the
-Space configuration.
-
-1. Create a Space: **New Space → SDK: Docker → Blank**, hardware **CPU basic (free)**.
-2. In the Space's **Settings → Variables and secrets**, add the secret `GEMINI_API_KEY`
-   (and optionally `GROQ_API_KEY`).
-3. Push this repo to the Space:
-   ```bash
-   git remote add space https://huggingface.co/spaces/<your-username>/<space-name>
-   git push --force space main      # password = a Hugging Face token with write access
-   ```
-4. Wait for the build (~5–10 min the first time), then open the Space URL.
-
-Free Spaces sleep after ~48 h without visitors, and uploaded data is wiped on restart.
-
 ## Deploying to Render (free)
 
 1. Push to GitHub. `.env`, `*.zip` and `app/data/` are git-ignored.
@@ -151,11 +122,11 @@ Free Spaces sleep after ~48 h without visitors, and uploaded data is wiped on re
 3. Set `GEMINI_API_KEY` (and optionally `GROQ_API_KEY`) on **chat-memory-api**.
 4. Set `BACKEND_URL` on **chat-memory-ui** to the API's public URL, e.g. `https://chat-memory-api.onrender.com`.
 
-**Free-tier limits:** the backend needs ~480 MB, close to Render's 512 MB, so larger chats may crash it. Hugging Face Spaces (above) has far more memory.
+**Free-tier limits:**
 
 - The backend sleeps after about 15 minutes idle. The UI shows *"Waking the server"* and retries automatically.
 - There is no persistent disk, so uploads are lost when the backend restarts. The UI detects this and asks you to re-upload.
-- `torch` plus the model is close to the 512 MB memory limit.
+- Memory: the backend uses well under the 512 MB limit (ONNX embeddings, no PyTorch).
 
 ## Known limits
 

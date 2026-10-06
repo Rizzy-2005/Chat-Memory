@@ -17,7 +17,9 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ui  # noqa: E402  (sibling module)
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").strip().rstrip("/")
+if not BACKEND_URL.startswith(("http://", "https://")):
+    BACKEND_URL = "https://" + BACKEND_URL  # e.g. "chat-memory-api.onrender.com"
 
 st.set_page_config(page_title="Chat Memory", page_icon=ui.LOGO_PATH, layout="centered", initial_sidebar_state="expanded")
 ui.inject_css()
@@ -380,4 +382,4 @@ digraph {
 }
 """
         )
-    st.caption("FastAPI · LangGraph · LangChain · Chroma · sentence-transformers · Gemini (Groq fallback) · SQLite · Streamlit · Docker")
+    st.caption("FastAPI · LangGraph · LangChain · Chroma · MiniLM (ONNX) · Gemini (Groq fallback) · SQLite · Streamlit · Docker")

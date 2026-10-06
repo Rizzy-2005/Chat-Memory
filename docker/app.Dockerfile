@@ -1,19 +1,17 @@
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    HF_HOME=/opt/hf-cache
+    PYTHONUNBUFFERED=1
 
 WORKDIR /workspace
-
-# CPU-only torch first, so sentence-transformers doesn't pull the multi-GB CUDA build.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Bake the embedding model into the image: no download at runtime, faster cold starts.
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+# Bake the ONNX embedding model (all-MiniLM-L6-v2) into the image:
+# no download at runtime, faster cold starts.
+# Retried because the model download (~80 MB) occasionally drops on build hosts.
+RUN for i in 1 2 3; do       python -c "from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2 as E; E()(['warm up'])" && break;       echo "model download failed, retrying ($i)"; sleep 5;     done
 
 COPY app/ ./app/
 

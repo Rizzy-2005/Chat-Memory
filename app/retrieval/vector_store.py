@@ -5,8 +5,10 @@ Two Chroma collections share one on-disk PersistentClient:
     "sessions"  — one document per SessionChunk (conversation context)
     "messages"  — one document per ParsedMessage (pinpoint search + citations)
 
-Embeddings: all-MiniLM-L6-v2, run locally on CPU (no key, no cost), with
-normalised vectors so distance behaves like cosine similarity.
+Embeddings: all-MiniLM-L6-v2, run locally on CPU (no key, no cost) through
+Chroma's bundled ONNX build of the model — the same weights and vectors as
+the sentence-transformers version, without PyTorch, so the backend fits in a
+512 MB free-tier instance.  Vectors are L2-normalised (cosine-like distance).
 
 Chroma metadata only supports scalar values and numeric range operators, so:
     * timestamps are stored twice: ISO string (readable) + epoch int (filterable)
@@ -34,7 +36,7 @@ from datetime import datetime
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.embeddings import Embeddings
 
 from app.config import settings
 from app.core import dedup
@@ -50,24 +52,40 @@ _BATCH = 256
 _TS_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] ", re.MULTILINE)
 
 # ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
+
+class MiniLMEmbeddings(Embeddings):
+    """LangChain wrapper around Chroma's ONNX all-MiniLM-L6-v2 (no PyTorch)."""
+
+    def __init__(self) -> None:
+        from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+
+        self._fn = ONNXMiniLM_L6_V2()
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [[float(x) for x in v] for v in self._fn(list(texts))] if texts else []
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_documents([text])[0]
+
+
+# ---------------------------------------------------------------------------
 # Singletons
 # ---------------------------------------------------------------------------
 
 _lock = threading.RLock()
-_embeddings: HuggingFaceEmbeddings | None = None
+_embeddings: Embeddings | None = None
 _client = None
 _stores: dict[str, Chroma] = {}
 
 
-def get_embeddings() -> HuggingFaceEmbeddings:
+def get_embeddings() -> Embeddings:
     """Return (and lazily load) the shared embedding model."""
     global _embeddings
     with _lock:
         if _embeddings is None:
-            _embeddings = HuggingFaceEmbeddings(
-                model_name=EMBED_MODEL,
-                encode_kwargs={"normalize_embeddings": True},
-            )
+            _embeddings = MiniLMEmbeddings()
         return _embeddings
 
 

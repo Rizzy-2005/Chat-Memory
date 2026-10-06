@@ -17,11 +17,10 @@ langgraph>=1.0
 langchain-google-genai>=4.0
 langchain-groq>=1.0
 langchain-chroma>=1.0
-langchain-huggingface>=1.0
 
-# Vector store + local embeddings
+# Vector store + local embeddings (all-MiniLM-L6-v2 via Chroma's bundled ONNX
+# runtime — no PyTorch, keeps the backend under 512 MB)
 chromadb>=1.0
-sentence-transformers
 
 # Relative date parsing fallback
 dateparser
