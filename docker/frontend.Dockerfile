@@ -1,17 +1,17 @@
 FROM python:3.11-slim
 
-WORKDIR /workspace
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Install frontend dependencies
-RUN pip install --no-cache-dir streamlit requests
+# Streamlit reads .streamlit/config.toml (the theme) from the working directory.
+WORKDIR /workspace/frontend
 
-# Copy frontend source
-COPY frontend/ ./frontend/
+COPY frontend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose Streamlit port
+COPY frontend/ .
+
 EXPOSE 8501
 
-# Run Streamlit; address 0.0.0.0 makes it reachable from outside the container
-CMD ["streamlit", "run", "frontend/app.py", \
-     "--server.port=8501", \
-     "--server.address=0.0.0.0"]
+# Render (and other hosts) inject $PORT; default to 8501 locally.
+CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true"]

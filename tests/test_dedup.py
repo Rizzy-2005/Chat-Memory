@@ -1,104 +1,74 @@
 """
-tests/test_dedup.py — unit tests for app/core/dedup.py
-
-Covers:
-    - All hashes new when DB is empty
-    - Already-seen hashes are filtered out
-    - Empty input is a no-op
-    - Double-recording the same hash is silently ignored
-    - Re-upload simulation: second upload reports zero new
-    - Partial overlap: only truly new hashes returned
+tests/test_dedup.py — app/core/dedup.py (SQLite seen-hashes index + stats).
 """
-
 from __future__ import annotations
 
 import pytest
 
-from app.core.dedup import get_new_hashes, record_hashes
+from app.core.dedup import get_meta, get_new_hashes, get_stats, record_hashes, reset_index, set_meta
 
-
-# ---------------------------------------------------------------------------
-# Fixture: fresh temporary SQLite path per test
-# ---------------------------------------------------------------------------
 
 @pytest.fixture
 def db(tmp_path) -> str:
-    """Return a path to a fresh (non-existent) SQLite file in a temp directory."""
     return str(tmp_path / "dedup_test.db")
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def _e(h: str, cid: str = "c1", ts: str = "2026-05-09T10:00:00", sender: str = "Ann"):
+    return (h, cid, ts, sender)
+
 
 class TestGetNewHashes:
-
     def test_all_new_when_db_is_empty(self, db):
-        hashes = ["aaa", "bbb", "ccc"]
-        result = get_new_hashes(hashes, db)
-        assert set(result) == {"aaa", "bbb", "ccc"}
+        assert get_new_hashes(["a", "b"], db) == ["a", "b"]
 
-    def test_empty_input_returns_empty(self, db):
+    def test_empty_input(self, db):
         assert get_new_hashes([], db) == []
 
-    def test_seen_hashes_are_filtered(self, db):
-        record_hashes([("aaa", "chunk1"), ("bbb", "chunk1")], db)
-        result = get_new_hashes(["aaa", "bbb", "ccc"], db)
-        assert result == ["ccc"]
+    def test_seen_filtered_order_preserved(self, db):
+        record_hashes([_e("b")], db)
+        assert get_new_hashes(["a", "b", "c"], db) == ["a", "c"]
 
-    def test_all_seen_returns_empty(self, db):
-        record_hashes([("x", "c1"), ("y", "c1"), ("z", "c1")], db)
-        assert get_new_hashes(["x", "y", "z"], db) == []
-
-    def test_order_preserved(self, db):
-        """Returned hashes keep the same order as the input list."""
-        record_hashes([("b", "c1")], db)
-        result = get_new_hashes(["a", "b", "c", "d"], db)
-        assert result == ["a", "c", "d"]
+    def test_many_hashes_batched(self, db):
+        hashes = [f"h{i}" for i in range(2500)]  # > SQLite's bound-parameter limit
+        record_hashes([_e(h) for h in hashes[:1200]], db)
+        assert get_new_hashes(hashes, db) == hashes[1200:]
 
 
 class TestRecordHashes:
-
-    def test_record_empty_is_no_op(self, db):
-        record_hashes([], db)  # must not raise
-        assert get_new_hashes(["aaa"], db) == ["aaa"]
-
     def test_double_record_ignored(self, db):
-        """INSERT OR IGNORE: recording the same hash twice is safe."""
-        record_hashes([("aaa", "chunk1")], db)
-        record_hashes([("aaa", "chunk2")], db)  # ignored — first chunk_id wins
-        # Hash is already seen regardless
-        assert get_new_hashes(["aaa"], db) == []
+        record_hashes([_e("a", "c1")], db)
+        record_hashes([_e("a", "c2")], db)
+        assert get_new_hashes(["a"], db) == []
+        assert get_stats(db)["total_messages"] == 1
 
-    def test_multiple_entries_in_one_call(self, db):
-        record_hashes([("h1", "c1"), ("h2", "c1"), ("h3", "c1")], db)
-        assert get_new_hashes(["h1", "h2", "h3", "h4"], db) == ["h4"]
-
-
-class TestReUploadSimulation:
-
-    def test_second_upload_returns_zero_new(self, db):
-        """Core dedup guarantee: uploading the same export twice → 0 new."""
-        hashes = ["hash_a", "hash_b", "hash_c", "hash_d"]
-
-        # First upload
-        new_first = get_new_hashes(hashes, db)
-        assert len(new_first) == 4
-        record_hashes([(h, "chunk_x") for h in new_first], db)
-
-        # Second upload — same hashes
-        new_second = get_new_hashes(hashes, db)
-        assert new_second == []
+    def test_reupload_reports_zero_new(self, db):
+        hashes = ["h1", "h2", "h3"]
+        record_hashes([_e(h) for h in get_new_hashes(hashes, db)], db)
+        assert get_new_hashes(hashes, db) == []
 
     def test_partial_overlap(self, db):
-        """If new messages are added to an existing chat export, only new ones are ingested."""
-        old_hashes = ["h1", "h2", "h3"]
-        new_hashes_added = ["h4", "h5"]
+        record_hashes([_e(h) for h in ["h1", "h2"]], db)
+        assert get_new_hashes(["h1", "h2", "h3", "h4"], db) == ["h3", "h4"]
 
-        # First upload
-        record_hashes([(h, "chunk_old") for h in old_hashes], db)
 
-        # Second upload with 3 old + 2 new messages
-        combined = old_hashes + new_hashes_added
-        result = get_new_hashes(combined, db)
-        assert set(result) == {"h4", "h5"}
+class TestStatsAndMeta:
+    def test_empty_stats(self, db):
+        assert get_stats(db) == {"total_messages": 0, "participants": [], "first_message": None, "last_message": None}
+
+    def test_stats(self, db):
+        record_hashes([
+            _e("1", ts="2026-05-09T10:00:00", sender="Ann"),
+            _e("2", ts="2026-05-10T10:00:00", sender="Bob"),
+            _e("3", ts="2026-07-01T10:00:00", sender="Bob"),
+        ], db)
+        s = get_stats(db)
+        assert s["total_messages"] == 3
+        assert s["participants"] == ["Bob", "Ann"]  # most active first
+        assert (s["first_message"], s["last_message"]) == ("2026-05-09", "2026-07-01")
+
+    def test_meta_and_reset(self, db):
+        set_meta("data_version", "2", db)
+        record_hashes([_e("a")], db)
+        reset_index(db)
+        assert get_meta("data_version", db) == "2"
+        assert get_new_hashes(["a"], db) == ["a"]

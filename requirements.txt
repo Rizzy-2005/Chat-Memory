@@ -1,28 +1,31 @@
-# Chat Memory — app/ dependencies
+# Chat Memory — backend (app/) dependencies
 # Install with: pip install -r requirements.txt
+# The Streamlit frontend has its own list: frontend/requirements.txt
 
 # Web framework
 fastapi
 uvicorn[standard]
+python-multipart
 
 # Config
-pydantic
+pydantic>=2
 pydantic-settings
 
 # LangChain ecosystem
-langchain
-langgraph
-langchain-google-genai
-langchain-groq
-langchain-chroma
-langchain-huggingface
+langchain-core>=1.0
+langgraph>=1.0
+langchain-google-genai>=4.0
+langchain-groq>=1.0
+langchain-chroma>=1.0
+langchain-huggingface>=1.0
 
-# Vector store + embeddings
-chromadb
+# Vector store + local embeddings
+chromadb>=1.0
 sentence-transformers
 
-# File upload support
-python-multipart
-
-# Date parsing for relative date resolution
+# Relative date parsing fallback
 dateparser
+
+# Tests
+pytest
+httpx

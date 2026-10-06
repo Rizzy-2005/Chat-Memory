@@ -1,231 +1,193 @@
 """
-tests/test_graph.py — unit tests for app/agent/graph.py and app/agent/tools.py
+tests/test_graph.py — the LangGraph agent (app/agent/graph.py).
 
-Strategy: mock the LangChain LLM (_get_llm) so tests run instantly without
-hitting the Gemini API or requiring Chroma/SQLite to be populated.
-
-Covers:
-    - router picks plain_rag_lookup for a general question
-    - router picks participant_filtered_lookup when a name is mentioned
-    - router picks message_pinpoint for a "find the message" question
-    - router picks date_range_lookup when a date is mentioned
-    - router falls back to plain_rag_lookup when LLM returns no tool call
-    - run_tool_node correctly dispatches to the chosen tool
-    - composer_node returns the expected structure
-    - composer_node handles a 'not found' scenario correctly
+The model is replaced by scripted replies and retrieval by fake tool results,
+so these tests check the plumbing: routing, the tool loop, the round limit,
+fallbacks, citation mapping and the not-found contract.
 """
-
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
+from langchain_core.messages import AIMessage
 
-from app.agent.graph import (
-    AgentState,
-    ComposerOutput,
-    Citation,
-    composer_node,
-    router_node,
-    run_tool_node,
-)
+from app.agent import graph
+from app.agent.graph import NOT_FOUND, ComposerOutput, run_query
+from app.agent.llm import LLMRateLimited
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _mock_tool_call(name: str, args: dict) -> MagicMock:
-    """Build a mock LLM response that contains one tool call."""
-    response = MagicMock()
-    response.tool_calls = [{"name": name, "args": args}]
-    return response
+MSGS = [
+    {"content_hash": "h1", "timestamp": "2026-07-02T19:14:00", "sender": "Priya", "text": "let's book 15th to 18th", "chunk_id": "c1"},
+    {"content_hash": "h2", "timestamp": "2026-07-02T19:20:00", "sender": "You", "text": "done, booking tonight", "chunk_id": "c1"},
+]
 
 
-def _mock_no_tool_call() -> MagicMock:
-    """Build a mock LLM response with NO tool call (fallback case)."""
-    response = MagicMock()
-    response.tool_calls = []
-    return response
+def call(name: str, args: dict, i: int = 0) -> AIMessage:
+    return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": f"call_{name}_{i}", "type": "tool_call"}])
 
 
-# ---------------------------------------------------------------------------
-# Router node tests
-# ---------------------------------------------------------------------------
+class Script:
+    """Feeds scripted agent replies, records what the agent saw."""
 
-class TestRouterNode:
-    """Test that the router picks the expected tool for each question type."""
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.calls = 0
 
-    def _run_router(self, llm_response: MagicMock, question: str) -> dict:
-        """Patch _get_llm and run the router_node."""
-        with patch("app.agent.graph._get_llm") as mock_get_llm:
-            mock_llm = MagicMock()
-            mock_llm.bind_tools.return_value.invoke.return_value = llm_response
-            mock_get_llm.return_value = mock_llm
-
-            state: AgentState = {"question": question}
-            return router_node(state)
-
-    def test_general_question_picks_plain_rag(self):
-        """Generic question → plain_rag_lookup."""
-        result = self._run_router(
-            _mock_tool_call("plain_rag_lookup", {"question": "what did we discuss?"}),
-            "what did we discuss?",
-        )
-        assert result["tool_name"] == "plain_rag_lookup"
-        assert "question" in result["tool_args"]
-
-    def test_sender_question_picks_participant_filter(self):
-        """Question mentioning a specific person → participant_filtered_lookup."""
-        result = self._run_router(
-            _mock_tool_call(
-                "participant_filtered_lookup",
-                {"question": "what did Arathi say?", "sender": "Arathi TKM CSE"},
-            ),
-            "what did Arathi say about TCS?",
-        )
-        assert result["tool_name"] == "participant_filtered_lookup"
-        assert result["tool_args"].get("sender") == "Arathi TKM CSE"
-
-    def test_pinpoint_question_picks_message_pinpoint(self):
-        """'Find the exact message' type → message_pinpoint."""
-        result = self._run_router(
-            _mock_tool_call("message_pinpoint", {"question": "find the message about NQT"}),
-            "find the specific message about NQT registration",
-        )
-        assert result["tool_name"] == "message_pinpoint"
-
-    def test_date_question_picks_date_range(self):
-        """Question mentioning a date range → date_range_lookup."""
-        result = self._run_router(
-            _mock_tool_call(
-                "date_range_lookup",
-                {"start_date": "2026-05-09", "end_date": "2026-05-12"},
-            ),
-            "what happened between 9 May and 12 May?",
-        )
-        assert result["tool_name"] == "date_range_lookup"
-        assert "start_date" in result["tool_args"]
-        assert "end_date" in result["tool_args"]
-
-    def test_fallback_when_no_tool_call(self):
-        """If the LLM returns no tool call, fall back to plain_rag_lookup."""
-        result = self._run_router(
-            _mock_no_tool_call(),
-            "what is going on?",
-        )
-        assert result["tool_name"] == "plain_rag_lookup"
-        assert result["tool_args"] == {"question": "what is going on?"}
+    def __call__(self, tools, messages):
+        self.calls += 1
+        reply = self.replies.pop(0) if self.replies else AIMessage(content="done")
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
 
-# ---------------------------------------------------------------------------
-# run_tool_node tests
-# ---------------------------------------------------------------------------
-
-class TestRunToolNode:
-
-    def test_dispatches_to_correct_tool(self):
-        """run_tool_node calls the right tool and stores its output in raw_results.
-
-        Must patch _TOOL_MAP (not the name plain_rag_lookup) because run_tool_node
-        looks up tools from the dict that was already built at import time.
-        """
-        fake_result = '[{"text": "Hello world", "metadata": {}}]'
-        mock_tool = MagicMock()
-        mock_tool.invoke.return_value = fake_result
-
-        with patch.dict("app.agent.graph._TOOL_MAP", {"plain_rag_lookup": mock_tool}):
-            state: AgentState = {
-                "question": "test?",
-                "tool_name": "plain_rag_lookup",
-                "tool_args": {"question": "test?"},
-            }
-            result = run_tool_node(state)
-
-        assert result["raw_results"] == fake_result
-        mock_tool.invoke.assert_called_once_with({"question": "test?"})
-
-    def test_unknown_tool_falls_back_to_plain_rag(self):
-        """An unrecognised tool_name falls back to plain_rag_lookup without crashing."""
-        with patch("app.agent.graph.plain_rag_lookup") as mock_tool:
-            mock_tool.invoke.return_value = "[]"
-
-            state: AgentState = {
-                "question": "anything?",
-                "tool_name": "nonexistent_tool",
-                "tool_args": {"question": "anything?"},
-            }
-            result = run_tool_node(state)
-
-        assert "raw_results" in result
+@pytest.fixture
+def fake_retrieval():
+    """search_sessions / message_pinpoint return MSGS; stats are fixed."""
+    with patch("app.agent.tools.vector_store.search_sessions", return_value=[
+        {"chunk_id": "c1", "start_ts": MSGS[0]["timestamp"], "end_ts": MSGS[1]["timestamp"],
+         "participants": ["Priya", "You"], "score": 0.1, "messages": MSGS}
+    ]) as ss, patch("app.agent.tools.vector_store.search_messages", return_value=[MSGS[0]]), \
+         patch("app.agent.tools.vector_store.message_window", side_effect=lambda m: [m]), \
+         patch("app.agent.tools.dedup.get_stats", return_value={"total_messages": 2, "participants": ["Priya", "You"],
+                                                               "first_message": "2026-07-02", "last_message": "2026-07-02"}), \
+         patch("app.agent.graph.dedup.get_stats", return_value={"total_messages": 2, "participants": ["Priya", "You"],
+                                                               "first_message": "2026-07-02", "last_message": "2026-07-02"}):
+        yield ss
 
 
-# ---------------------------------------------------------------------------
-# composer_node tests
-# ---------------------------------------------------------------------------
+def composer_returns(out: ComposerOutput):
+    def fake(schema, build):
+        _prompt, payload = build(30000)
+        return out, payload
+    return fake
 
-class TestComposerNode:
 
-    def _make_composer_output(self, answer: str, citations: list[Citation]) -> ComposerOutput:
-        return ComposerOutput(answer=answer, citations=citations, mode_used="plain_rag_lookup")
+def test_sender_and_date_filters_in_one_call(fake_retrieval):
+    agent = Script(call("search_sessions", {"question": "the trip", "sender": "priya", "start_date": "2026-07-01", "end_date": "2026-07-15"}))
+    with patch.object(graph, "invoke_with_tools", agent), patch.object(
+        graph, "invoke_structured_budgeted", composer_returns(ComposerOutput(found=True, answer="Booked 15–18 Aug.", citation_ids=[2, 1]))
+    ):
+        out = run_query("what did Priya say about the trip in early July?")
 
-    def test_returns_answer_and_citations(self):
-        """Composer returns answer, citation list, and mode_used."""
-        composer_result = self._make_composer_output(
-            answer="The TCS NQT registration deadline is 15 May 2026.",
-            citations=[Citation(timestamp="2026-05-09T17:37:00", sender="Arathi TKM CSE")],
-        )
-        with patch("app.agent.graph._get_llm") as mock_get_llm:
-            mock_llm = MagicMock()
-            mock_llm.with_structured_output.return_value.invoke.return_value = composer_result
-            mock_get_llm.return_value = mock_llm
+    args = fake_retrieval.call_args.args
+    assert args[1] == ["Priya"]                                      # fuzzy name → exact participant
+    assert args[2].date().isoformat() == "2026-07-01" and args[3].date().isoformat() == "2026-07-15"
+    assert out["found"] is True
+    assert out["mode_used"] == "search_sessions"
+    assert out["filters"] == {"sender": "Priya", "start_date": "2026-07-01", "end_date": "2026-07-15"}
+    # citations come from the real messages, chronological
+    assert [(c["sender"], c["timestamp"]) for c in out["citations"]] == [("Priya", MSGS[0]["timestamp"]), ("You", MSGS[1]["timestamp"])]
+    assert out["citations"][0]["excerpt"] == MSGS[0]["text"]
+    assert agent.calls == 2  # tool round, then "done"
 
-            state: AgentState = {
-                "question": "When is TCS NQT registration deadline?",
-                "tool_name": "plain_rag_lookup",
-                "raw_results": '[{"text": "[2026-05-09 17:37] Arathi TKM CSE: TCS NQT last date 15 May", "metadata": {}}]',
-            }
-            result = composer_node(state)
 
-        assert result["answer"] == "The TCS NQT registration deadline is 15 May 2026."
-        assert len(result["citations"]) == 1
-        assert result["citations"][0]["sender"] == "Arathi TKM CSE"
-        assert result["mode_used"] == "plain_rag_lookup"
+def test_pinpoint_route(fake_retrieval):
+    agent = Script(call("message_pinpoint", {"question": "shared the link"}))
+    with patch.object(graph, "invoke_with_tools", agent), patch.object(
+        graph, "invoke_structured_budgeted", composer_returns(ComposerOutput(found=True, answer="Priya did.", citation_ids=[1]))
+    ):
+        out = run_query("find the message where someone shared the link")
+    assert out["mode_used"] == "message_pinpoint"
+    assert out["tool_calls"] == ["message_pinpoint"]
 
-    def test_not_found_returns_empty_citations(self):
-        """When nothing relevant is found, answer is explicit and citations are empty."""
-        not_found = self._make_composer_output(
-            answer="I couldn't find anything in the chat about that.",
-            citations=[],
-        )
-        with patch("app.agent.graph._get_llm") as mock_get_llm:
-            mock_llm = MagicMock()
-            mock_llm.with_structured_output.return_value.invoke.return_value = not_found
-            mock_get_llm.return_value = mock_llm
 
-            state: AgentState = {
-                "question": "What is the capital of France?",
-                "tool_name": "plain_rag_lookup",
-                "raw_results": '{"message": "No relevant sessions found."}',
-            }
-            result = composer_node(state)
+def test_invented_citation_ids_mean_not_found(fake_retrieval):
+    agent = Script(call("search_sessions", {"question": "x"}))
+    with patch.object(graph, "invoke_with_tools", agent), patch.object(
+        graph, "invoke_structured_budgeted", composer_returns(ComposerOutput(found=True, answer="Something", citation_ids=[99]))
+    ):
+        out = run_query("q")
+    assert out["found"] is False and out["answer"] == NOT_FOUND and out["citations"] == []
 
-        assert "couldn't find" in result["answer"].lower()
-        assert result["citations"] == []
 
-    def test_composer_handles_llm_exception_gracefully(self):
-        """If the LLM throws, composer returns a safe error message — no crash."""
-        with patch("app.agent.graph._get_llm") as mock_get_llm:
-            mock_llm = MagicMock()
-            mock_llm.with_structured_output.return_value.invoke.side_effect = RuntimeError("API error")
-            mock_get_llm.return_value = mock_llm
+def test_composer_not_found(fake_retrieval):
+    agent = Script(call("search_sessions", {"question": "cake"}))
+    with patch.object(graph, "invoke_with_tools", agent), patch.object(
+        graph, "invoke_structured_budgeted", composer_returns(ComposerOutput(found=False, answer=NOT_FOUND, citation_ids=[]))
+    ):
+        out = run_query("chocolate cake recipe?")
+    assert out == {**out, "found": False, "answer": NOT_FOUND, "citations": []}
 
-            state: AgentState = {
-                "question": "test",
-                "tool_name": "plain_rag_lookup",
-                "raw_results": "[]",
-            }
-            result = composer_node(state)
 
-        assert "Error" in result["answer"]
-        assert result["citations"] == []
+def test_nothing_retrieved_skips_composer_llm(fake_retrieval):
+    fake_retrieval.return_value = []
+    agent = Script(call("search_sessions", {"question": "x"}))
+    with patch.object(graph, "invoke_with_tools", agent), patch.object(graph, "invoke_structured_budgeted") as comp:
+        out = run_query("q")
+    comp.assert_not_called()
+    assert out["found"] is False and out["answer"] == NOT_FOUND
+
+
+def test_model_skipping_tools_still_searches(fake_retrieval):
+    agent = Script(AIMessage(content="I think the answer is 42"))  # no tool call
+    with patch.object(graph, "invoke_with_tools", agent), patch.object(
+        graph, "invoke_structured_budgeted", composer_returns(ComposerOutput(found=True, answer="ok", citation_ids=[1]))
+    ):
+        out = run_query("what was decided?")
+    assert out["tool_calls"] == ["search_sessions"]
+    assert agent.calls == 1  # forced search goes straight to the composer
+
+
+def test_agent_error_falls_back_to_plain_search(fake_retrieval):
+    agent = Script(RuntimeError("503 overloaded"))
+    with patch.object(graph, "invoke_with_tools", agent), patch.object(
+        graph, "invoke_structured_budgeted", composer_returns(ComposerOutput(found=True, answer="ok", citation_ids=[1]))
+    ):
+        out = run_query("q")
+    assert out["found"] is True and out["tool_calls"] == ["search_sessions"]
+
+
+def test_rate_limit_propagates(fake_retrieval):
+    with patch.object(graph, "invoke_with_tools", Script(LLMRateLimited("429"))):
+        with pytest.raises(LLMRateLimited):
+            run_query("q")
+
+
+def test_round_limit(fake_retrieval, monkeypatch):
+    monkeypatch.setattr(graph.settings, "max_tool_rounds", 2)
+    agent = Script(*[call("search_sessions", {"question": f"variant {i}"}, i) for i in range(10)])
+    with patch.object(graph, "invoke_with_tools", agent), patch.object(
+        graph, "invoke_structured_budgeted", composer_returns(ComposerOutput(found=True, answer="ok", citation_ids=[1]))
+    ):
+        out = run_query("q")
+    assert out["tool_calls"] == ["search_sessions", "search_sessions"]
+
+
+def test_duplicate_call_goes_to_composer(fake_retrieval):
+    same = {"question": "trip"}
+    agent = Script(call("search_sessions", same, 0), call("search_sessions", {"question": "  TRIP "}, 1))
+    with patch.object(graph, "invoke_with_tools", agent), patch.object(
+        graph, "invoke_structured_budgeted", composer_returns(ComposerOutput(found=True, answer="ok", citation_ids=[1]))
+    ):
+        out = run_query("q")
+    assert out["tool_calls"] == ["search_sessions"]
+
+
+def test_date_tool_result_reaches_answer(fake_retrieval):
+    agent = Script(
+        call("search_sessions", {"question": "meeting"}),
+        call("resolve_date_reference", {"reference_text": "next Friday", "message_timestamp": "2026-05-09 17:37"}, 1),
+    )
+    with patch.object(graph, "invoke_with_tools", agent), patch.object(
+        graph, "invoke_structured_budgeted", composer_returns(ComposerOutput(found=True, answer="Fri 15 May", citation_ids=[1]))
+    ):
+        out = run_query("when is the meeting?")
+    assert out["tool_calls"] == ["search_sessions", "resolve_date_reference"]
+    assert out["date_resolutions"][0]["resolved_date"] == "2026-05-15"
+
+
+def test_unknown_participant_message(fake_retrieval):
+    from app.agent.tools import search_sessions
+
+    text = search_sessions.invoke({"question": "x", "sender": "Zebediah"})
+    assert "No participant matches 'Zebediah'" in text and "Priya" in text
+
+
+def test_rate_limit_after_retrieval_still_answers(fake_retrieval):
+    agent = Script(call("search_sessions", {"question": "trip"}), LLMRateLimited("429"))
+    with patch.object(graph, "invoke_with_tools", agent), patch.object(
+        graph, "invoke_structured_budgeted", composer_returns(ComposerOutput(found=True, answer="ok", citation_ids=[1]))
+    ):
+        out = run_query("q")
+    assert out["found"] is True and out["tool_calls"] == ["search_sessions"]
