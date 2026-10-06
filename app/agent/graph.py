@@ -1,210 +1,334 @@
 """
-graph.py — LangGraph StateGraph: router → run_tool → composer.
+graph.py — the LangGraph agent: agent ⇄ tools → composer.
 
-Flow:
-    1. router   — one Gemini call with all 4 tools bound; decides which tool and args.
-    2. run_tool — executes the chosen tool, stores raw JSON results in state.
-    3. composer — second Gemini call that reads the raw results and emits a
-                  structured { answer, citations, mode_used } response.
+    START → agent ──(reply has tool_calls?)──yes──▶ tools ──▶ agent  (loop)
+                  └─────────────no──────────────▶ composer ──▶ END
 
-Hard rules enforced in the composer system prompt:
-  - Every claim must cite a retrieved message (timestamp + sender).
-  - If nothing relevant is in the retrieved context → "I couldn't find anything
-    in the chat about that." with empty citations.  Never fabricate.
+* agent    — the chat model with the three tools bound. Its reply either
+             contains tool_calls (its own choice of tool + arguments) or not;
+             routing is just checking that.  Rounds are capped at
+             MAX_TOOL_ROUNDS so a confused model cannot loop forever.
+* tools    — runs every requested tool and appends ToolMessages (with
+             artifacts holding the real retrieved messages).
+* composer — a separate structured-output call that writes the answer ONLY
+             from the retrieved messages and cites them by number.  Citations
+             are mapped back to real messages in code, never trusted as text.
+             Nothing retrieved / nothing relevant → the fixed not-found answer.
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any, TypedDict
+import logging
+from datetime import date
+from typing import Annotated, Any, TypedDict
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_groq import ChatGroq
-from langgraph.graph import END, StateGraph
-from pydantic import BaseModel
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from pydantic import BaseModel, Field
 
-from app.agent.tools import (
-    date_range_lookup,
-    message_pinpoint,
-    participant_filtered_lookup,
-    plain_rag_lookup,
-    resolve_relative_dates_in_context,
+from app.agent import context as ctx
+from app.agent.llm import (
+    LLMNotConfigured,
+    LLMRateLimited,
+    invoke_structured_budgeted,
+    invoke_with_tools,
 )
+from app.agent.tools import RETRIEVAL_TOOLS, TOOL_MAP, TOOLS
 from app.config import settings
+from app.core import dedup
+
+log = logging.getLogger(__name__)
+
+NOT_FOUND = "I couldn't find anything in the chat about that."
+
 
 # ---------------------------------------------------------------------------
-# State
+# State and structured output
 # ---------------------------------------------------------------------------
 
 class AgentState(TypedDict, total=False):
-    """Typed state bag threaded through every node in the graph.
-
-    Only 'question' is required at graph invocation time.
-    Each subsequent node fills in its own keys.
-    """
-    question: str          # the user's natural-language question
-    tool_name: str         # set by router: which tool was selected
-    tool_args: dict[str, Any]   # set by router: arguments to pass to the tool
-    raw_results: str       # set by run_tool: JSON string returned by the tool
-    answer: str            # set by composer: final prose answer
-    citations: list[dict]  # set by composer: [{timestamp, sender}, ...]
-    mode_used: str         # set by composer: tool name echoed for transparency
-
-
-# ---------------------------------------------------------------------------
-# Pydantic schema for structured composer output
-# ---------------------------------------------------------------------------
-
-class Citation(BaseModel):
-    timestamp: str
-    sender: str
+    question: str
+    messages: Annotated[list[AnyMessage], add_messages]  # running conversation with the agent
+    tool_rounds: int
+    forced_search: bool    # the agent model failed / skipped tools → plain search, then compose
+    # filled by the composer
+    answer: str
+    citations: list[dict]
+    found: bool
+    mode_used: str
+    filters: dict
+    tool_calls: list[str]
+    trace: list[dict]
+    date_resolutions: list[dict]
 
 
 class ComposerOutput(BaseModel):
-    answer: str
-    citations: list[Citation]
-    mode_used: str
+    """Structured answer written from the numbered retrieved messages."""
+
+    found: bool = Field(description="True only if the numbered messages actually answer the question.")
+    answer: str = Field(description="The answer, concise and natural. No [n] markers in the text.")
+    citation_ids: list[int] = Field(
+        default_factory=list,
+        description="Numbers of the messages that support the answer (e.g. [3, 7]). Empty if found is false.",
+    )
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Prompts
 # ---------------------------------------------------------------------------
 
-_TOOLS = [plain_rag_lookup, participant_filtered_lookup, message_pinpoint, date_range_lookup]
+_AGENT_PROMPT = """\
+You are the retrieval planner for a question-answering app over ONE exported WhatsApp chat.
+Today is {today_weekday}, {today}.
+The chat has {total} messages from {first} to {last}.
+Participants (exact names): {participants}
 
-_TOOL_MAP = {
-    "plain_rag_lookup": plain_rag_lookup,
-    "participant_filtered_lookup": participant_filtered_lookup,
-    "message_pinpoint": message_pinpoint,
-    "date_range_lookup": date_range_lookup,
-}
+Your job is to call tools that fetch the chat messages needed to answer the user's question.
+You do NOT write the final answer; a later step does that from what you retrieve.
 
-_ROUTER_SYSTEM = """\
-You are the router for a WhatsApp chat question-answering system.
-Given a user question, call exactly one of the four available tools:
+How to choose:
+- search_sessions — the default. Set `sender` only if the question is about what a specific
+  person said or did (use the exact participant name). Set start_date/end_date (YYYY-MM-DD)
+  only if the question names a date or period: convert "in June", "on 12 May", "last week",
+  "between 1 and 15 July" to absolute dates using today's date and the chat's date span
+  (a month without a year means the year in which the chat covers that month).
+  Sender and dates can be combined in one call.
+  Search is by meaning, not by time — so for "latest", "most recent", "last message" or
+  "recently" questions, set start_date to 7 days before the chat's last message date and
+  end_date to the last message date.
+- message_pinpoint — only when the user wants one particular message or quote
+  ("find the message where…", "who sent the link to…", "who said '…'").
+- resolve_date_reference — when a retrieved message contains a relative date ("next Friday",
+  "tomorrow") that matters for the question, call it with that phrase and that message's
+  timestamp. Never do date arithmetic yourself.
 
-  plain_rag_lookup            — general questions without a specific sender or date
-  participant_filtered_lookup — questions about what a specific person said/did
-  message_pinpoint            — looking for one precise quote or specific message
-  date_range_lookup           — questions about events on specific dates or periods
+One search is usually enough: the results are only previews, and the answer is written later
+from the full messages. Search again ONLY if the results contain nothing relevant (then retry
+once with different wording or fewer filters). Never repeat a search with near-identical wording.
+When you have what you need, reply with the single word "done" and no tool call."""
 
-Always call exactly one tool.  Do NOT attempt to answer the question yourself."""
+_COMPOSER_PROMPT = """\
+You answer questions about a WhatsApp chat using ONLY the numbered messages below.
 
-_COMPOSER_SYSTEM = """\
-You are answering questions about a WhatsApp group chat.
-You have been given retrieved context from the chat.
+Hard rules:
+1. Use only what the numbered messages say. Never use general knowledge or guess.
+2. Every factual claim must be supported by messages you list in citation_ids.
+3. If the messages do not contain the answer, set found=false, answer exactly
+   "{not_found}" and return an empty citation_ids list. If they are related and answer
+   part of the question, give that partial answer (found=true) and say what is missing.
+4. Never invent names, dates, numbers or quotes.
+5. When a date matters, use the resolved dates provided (e.g. "Fri 15 May 2026"). If the
+   question asks whether something is upcoming, still on, or past, compare the event's date
+   with today ({today}) and say so explicitly.
+6. Write a direct, natural answer (1–5 sentences or a short list). Mention who said what.
+   Do not put [n] markers in the answer text.
 
-STRICT RULES — follow every one without exception:
-1. ONLY use information explicitly present in the retrieved context below.
-2. Every factual claim in your answer MUST be backed by a citation listing the exact
-   timestamp and sender from the retrieved context.
-3. If the retrieved context does not contain information relevant to the question,
-   set answer to exactly: "I couldn't find anything in the chat about that."
-   and return an empty citations list.
-4. NEVER fabricate facts, names, dates, or quotes.
-5. NEVER use general knowledge — only what is in the context.
-6. For mode_used, return the tool name that retrieved the context."""
+Question: {question}
+
+Retrieved messages:
+{messages}
+
+{date_notes}"""
+
+
+def _agent_system_prompt() -> str:
+    stats = dedup.get_stats()
+    participants = stats["participants"]
+    shown = ", ".join(participants[:60]) + (" …" if len(participants) > 60 else "")
+    today = date.today()
+    return _AGENT_PROMPT.format(
+        today=today.isoformat(),
+        today_weekday=today.strftime("%A"),
+        total=stats["total_messages"],
+        first=stats["first_message"] or "n/a",
+        last=stats["last_message"] or "n/a",
+        participants=shown or "(none yet)",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Nodes
 # ---------------------------------------------------------------------------
 
-def _get_llm() -> ChatGroq:
-    """Return a Groq LLM instance (free tier, high RPM, supports tool-calling)."""
-    return ChatGroq(
-        model=settings.groq_model,
-        api_key=settings.groq_api_key,
-        temperature=0,
+def _retrieval_done(messages: list[AnyMessage]) -> bool:
+    return any(isinstance(m, ToolMessage) and m.name in RETRIEVAL_TOOLS for m in messages)
+
+
+def _fallback_call(question: str, n: int) -> AIMessage:
+    """Force a plain session search (used when the model skips tools or errors)."""
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": "search_sessions", "args": {"question": question}, "id": f"fallback_{n}", "type": "tool_call"}],
     )
 
 
-from typing import Any, Literal, TypedDict
+def _call_key(call: dict) -> str:
+    args = {k: " ".join(str(v).lower().split()) for k, v in (call.get("args") or {}).items() if v not in (None, "")}
+    return f"{call['name']}|{sorted(args.items())}"
 
 
-class RouterSelection(BaseModel):
-    tool_name: Literal[
-        "plain_rag_lookup",
-        "participant_filtered_lookup",
-        "message_pinpoint",
-        "date_range_lookup",
-    ]
-    question: str = ""
-    sender: str = ""
-    start_date: str = ""
-    end_date: str = ""
+def _agent_view(history: list[AnyMessage]) -> list[AnyMessage]:
+    """What the agent model sees.  Tool results from earlier rounds are shrunk
+    to a one-line note (the composer still gets everything via artifacts),
+    which keeps each call well inside free-tier tokens-per-minute limits."""
+    last_ai = max((i for i, m in enumerate(history) if isinstance(m, AIMessage)), default=-1)
+    view = []
+    for i, m in enumerate(history):
+        if isinstance(m, ToolMessage) and i < last_ai:
+            n = len((m.artifact or {}).get("messages", [])) if isinstance(m.artifact, dict) else 0
+            m = m.model_copy(update={"content": f"(earlier result, {n} messages — already passed to the answer writer)"})
+        view.append(m)
+    return view
 
 
-def router_node(state: AgentState) -> dict:
-    """Decide which retrieval tool to call and with what arguments using structured output."""
-    llm = _get_llm().with_structured_output(RouterSelection)
-    prompt = (
-        f"{_ROUTER_SYSTEM}\n\n"
-        f"Question: {state['question']}\n\n"
-        "Select the appropriate tool and supply its arguments."
-    )
+def agent_node(state: AgentState) -> dict:
+    rounds = state.get("tool_rounds", 0)
+    if rounds >= settings.max_tool_rounds or state.get("forced_search"):
+        return {}  # loop limit reached / fallback used → router sends us to the composer
+
+    history = state.get("messages", [])
     try:
-        sel: RouterSelection = llm.invoke(prompt)
-        tool_args: dict[str, Any] = {}
-        tool_name = sel.tool_name
+        reply = invoke_with_tools(TOOLS, [SystemMessage(_agent_system_prompt()), *_agent_view(history)])
+    except LLMNotConfigured:
+        raise
+    except Exception as exc:
+        if _retrieval_done(history):
+            log.warning("Agent failed (%s); composing from what was already retrieved.", exc)
+            return {}
+        if isinstance(exc, LLMRateLimited):
+            raise  # nothing retrieved yet and the composer would fail the same way
+        log.warning("Agent failed on every model (%s); falling back to a plain search.", exc)
+        reply = None
 
-        if tool_name == "date_range_lookup" and (not sel.start_date or not sel.end_date):
-            # If model selected date_range_lookup without valid dates, default to plain_rag_lookup
-            tool_name = "plain_rag_lookup"
+    if reply is not None and reply.tool_calls:
+        # Drop exact repeats of earlier calls; if nothing new is asked, compose.
+        done = {_call_key(c) for m in history if isinstance(m, AIMessage) for c in m.tool_calls}
+        fresh = [c for c in reply.tool_calls if _call_key(c) not in done]
+        if not fresh and _retrieval_done(history):
+            return {}
+        if len(fresh) != len(reply.tool_calls):
+            reply = reply.model_copy(update={"tool_calls": fresh})
 
-        if tool_name in ("plain_rag_lookup", "message_pinpoint"):
-            tool_args = {"question": sel.question or state["question"]}
-        elif tool_name == "participant_filtered_lookup":
-            tool_args = {
-                "question": sel.question or state["question"],
-                "sender": sel.sender,
-            }
-        elif tool_name == "date_range_lookup":
-            tool_args = {
-                "start_date": sel.start_date,
-                "end_date": sel.end_date,
-            }
-        return {"tool_name": tool_name, "tool_args": tool_args}
-    except Exception:
-        return {
-            "tool_name": "plain_rag_lookup",
-            "tool_args": {"question": state["question"]},
-        }
+    if reply is None or (not reply.tool_calls and not _retrieval_done(history)):
+        # A RAG answer must be grounded: never skip retrieval entirely.  The
+        # synthetic call is never shown to a model again (Gemini rejects tool
+        # calls it did not sign), so after it we go straight to the composer.
+        return {"messages": [_fallback_call(state["question"], rounds)], "tool_rounds": rounds + 1, "forced_search": True}
+    if reply.tool_calls:
+        return {"messages": [reply], "tool_rounds": rounds + 1}
+    return {"messages": [reply]}
 
 
-def run_tool_node(state: AgentState) -> dict:
-    """Execute the tool the router selected and store the raw JSON result."""
-    tool_fn = _TOOL_MAP.get(state.get("tool_name", "plain_rag_lookup"), plain_rag_lookup)
-    result = tool_fn.invoke(state.get("tool_args", {"question": state["question"]}))
-    return {"raw_results": str(result)}
+def tools_node(state: AgentState) -> dict:
+    """Run every tool call in the last AI message; errors become ToolMessages."""
+    last = state["messages"][-1]
+    results: list[ToolMessage] = []
+    for call in last.tool_calls:
+        tool = TOOL_MAP.get(call["name"])
+        if tool is None:
+            results.append(ToolMessage(content=f"Unknown tool '{call['name']}'.", tool_call_id=call["id"], name=call["name"], status="error"))
+            continue
+        try:
+            results.append(tool.invoke({**call, "type": "tool_call"}))
+        except Exception as exc:  # bad arguments, storage error, …
+            log.warning("Tool %s failed: %s", call["name"], exc)
+            results.append(ToolMessage(content=f"Tool error: {exc}", tool_call_id=call["id"], name=call["name"], status="error"))
+    return {"messages": results}
+
+
+def route_after_agent(state: AgentState) -> str:
+    last = state["messages"][-1] if state.get("messages") else None
+    if isinstance(last, AIMessage) and last.tool_calls:
+        return "tools"
+    return "composer"
+
+
+def _collect(state: AgentState) -> tuple[list[dict], list[dict], list[dict], list[str]]:
+    """From the ToolMessages: retrieved messages, agent-requested date results,
+    a per-call trace for the UI, and the ordered list of tool names called."""
+    retrieved: list[dict] = []
+    agent_dates: list[dict] = []
+    trace: list[dict] = []
+    calls: list[str] = []
+    args_by_id = {
+        c["id"]: c["args"]
+        for m in state.get("messages", [])
+        if isinstance(m, AIMessage)
+        for c in m.tool_calls
+    }
+    for m in state.get("messages", []):
+        if not isinstance(m, ToolMessage):
+            continue
+        calls.append(m.name)
+        art = m.artifact if isinstance(m.artifact, dict) else {}
+        entry = {"tool": m.name, "args": args_by_id.get(m.tool_call_id, {}), "ok": m.status != "error"}
+        if art.get("kind") in RETRIEVAL_TOOLS:
+            retrieved.extend(art.get("messages", []))
+            entry["filters"] = art.get("filters")
+            entry["results"] = len(art.get("messages", []))
+        elif art.get("kind") == "date":
+            res = art.get("result", {})
+            entry["result"] = res
+            if res.get("status") != "error":
+                agent_dates.append(res)
+        trace.append(entry)
+    return retrieved, agent_dates, trace, calls
 
 
 def composer_node(state: AgentState) -> dict:
-    """Turn raw retrieval results into a grounded, cited answer."""
-    raw_results = state.get("raw_results", "No context retrieved.")
-    date_info = resolve_relative_dates_in_context(raw_results)
+    retrieved, agent_dates, trace, calls = _collect(state)
+    retrieval_entries = [t for t in trace if t["tool"] in RETRIEVAL_TOOLS]
+    first = next((t for t in retrieval_entries if t.get("results")), retrieval_entries[0] if retrieval_entries else None)
+    meta = {
+        "mode_used": first["tool"] if first else "none",
+        "filters": (first or {}).get("filters") or {"sender": None, "start_date": None, "end_date": None},
+        "tool_calls": calls,
+        "trace": trace,
+    }
+    not_found = {**meta, "answer": NOT_FOUND, "citations": [], "found": False, "date_resolutions": []}
 
-    llm = _get_llm().with_structured_output(ComposerOutput)
-    prompt = (
-        f"{_COMPOSER_SYSTEM}\n\n"
-        f"Tool used: {state.get('tool_name', 'unknown')}\n\n"
-        f"Retrieved context:\n{raw_results}{date_info}\n\n"
-        f"Question: {state['question']}\n\n"
-        "Produce your structured answer now."
-    )
-    try:
-        result: ComposerOutput = llm.invoke(prompt)
-        return {
-            "answer": result.answer,
-            "citations": [c.model_dump() for c in result.citations],
-            "mode_used": state.get("tool_name", "unknown"),
-        }
-    except Exception as exc:
-        return {
-            "answer": f"Error generating answer: {exc}",
-            "citations": [],
-            "mode_used": state.get("tool_name", "unknown"),
-        }
+    pool = ctx.dedupe_messages(retrieved)
+    if not pool:
+        return not_found
+
+    def build(budget: int):
+        # Numbering depends on the model's context budget, so the exact list
+        # numbered in the prompt travels back with the answer.
+        msgs = sorted(ctx.fit_budget(pool, budget), key=lambda m: m["timestamp"])
+        dates = ctx.auto_date_resolutions(msgs)
+        prompt = _COMPOSER_PROMPT.format(
+            not_found=NOT_FOUND,
+            today=date.today().isoformat(),
+            question=state["question"],
+            messages=ctx.numbered_lines(msgs),
+            date_notes=ctx.date_notes_text(dates, agent_dates),
+        )
+        return prompt, (msgs, dates)
+
+    out, (messages, auto_dates) = invoke_structured_budgeted(ComposerOutput, build)
+
+    ids = ctx.valid_ids(out.citation_ids, len(messages))
+    if not out.found or not ids or out.answer.strip() == NOT_FOUND:
+        return not_found
+
+    cited = sorted(ids, key=lambda i: messages[i - 1]["timestamp"])
+    # Date callouts: what the agent explicitly resolved + phrases inside cited messages.
+    resolutions = list(agent_dates) + [r for i in cited for r in auto_dates.get(i, [])]
+    unique, seen = [], set()
+    for r in resolutions:
+        key = (r["reference_text"].lower(), r["reference_timestamp"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+
+    return {
+        **meta,
+        "answer": out.answer.strip(),
+        "citations": [ctx.citation(messages[i - 1]) for i in cited],
+        "found": True,
+        "date_resolutions": unique,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -212,27 +336,41 @@ def composer_node(state: AgentState) -> dict:
 # ---------------------------------------------------------------------------
 
 def build_graph():
-    """Construct and compile the LangGraph StateGraph."""
     g = StateGraph(AgentState)
-    g.add_node("router", router_node)
-    g.add_node("run_tool", run_tool_node)
+    g.add_node("agent", agent_node)
+    g.add_node("tools", tools_node)
     g.add_node("composer", composer_node)
-
-    g.set_entry_point("router")
-    g.add_edge("router", "run_tool")
-    g.add_edge("run_tool", "composer")
+    g.add_edge(START, "agent")
+    g.add_conditional_edges("agent", route_after_agent, {"tools": "tools", "composer": "composer"})
+    g.add_edge("tools", "agent")
     g.add_edge("composer", END)
-
     return g.compile()
 
 
-# Module-level singleton — built once per process
 _graph = None
 
 
 def get_graph():
-    """Return (and lazily build) the compiled LangGraph agent."""
+    """Return (and lazily build) the compiled graph."""
     global _graph
     if _graph is None:
         _graph = build_graph()
     return _graph
+
+
+def run_query(question: str) -> dict[str, Any]:
+    """Run one question through the agent and return the API-shaped result."""
+    result = get_graph().invoke(
+        {"question": question, "messages": [HumanMessage(question)], "tool_rounds": 0},
+        config={"recursion_limit": 4 * settings.max_tool_rounds + 6},
+    )
+    return {
+        "answer": result.get("answer", NOT_FOUND),
+        "citations": result.get("citations", []),
+        "mode_used": result.get("mode_used", "none"),
+        "filters": result.get("filters", {"sender": None, "start_date": None, "end_date": None}),
+        "tool_calls": result.get("tool_calls", []),
+        "found": result.get("found", False),
+        "date_resolutions": result.get("date_resolutions", []),
+        "trace": result.get("trace", []),
+    }

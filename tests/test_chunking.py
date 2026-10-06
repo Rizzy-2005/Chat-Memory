@@ -148,3 +148,22 @@ class TestChunkMessages:
         chunks = chunk_messages(msgs, gap_hours=2.0)
         # 2.0 > 2.0 is False → same session
         assert len(chunks) == 1
+
+
+class TestSizeCap:
+
+    def test_long_session_is_split_at_message_boundaries(self):
+        msgs = [_msg(10, i, "Alice", "x" * 300) for i in range(10)]  # ~3,300 chars, one session
+        chunks = chunk_messages(msgs, gap_hours=2.0, max_chars=1000)
+        assert len(chunks) == 4
+        assert all(len(c.text) <= 1000 for c in chunks)
+        assert sum(c.message_count for c in chunks) == 10
+        assert chunks[0].end_ts <= chunks[1].start_ts
+
+    def test_single_oversized_message_kept_whole(self):
+        chunks = chunk_messages([_msg(10, 0, "Alice", "y" * 5000)], gap_hours=2.0, max_chars=1000)
+        assert len(chunks) == 1 and "y" * 5000 in chunks[0].text
+
+    def test_zero_disables_splitting(self):
+        msgs = [_msg(10, i, "Alice", "x" * 300) for i in range(10)]
+        assert len(chunk_messages(msgs, gap_hours=2.0, max_chars=0)) == 1

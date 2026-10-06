@@ -8,9 +8,18 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      # Inside the container, data lives in the named volume below.
+      - CHROMA_PERSIST_DIR=/data/chroma
+      - SQLITE_PATH=/data/dedup.db
     volumes:
-      # Named volume keeps Chroma + dedup.db alive across container restarts.
-      - chat_data:/workspace/app/data
+      - chat_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     restart: unless-stopped
 
   # ── Streamlit frontend ───────────────────────────────────────────────────────
@@ -23,7 +32,8 @@ services:
     environment:
       - BACKEND_URL=http://app:8000
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

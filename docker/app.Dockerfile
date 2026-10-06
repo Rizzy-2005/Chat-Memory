@@ -1,22 +1,23 @@
 FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/opt/hf-cache
+
 WORKDIR /workspace
 
-# Pre-install CPU-only torch to avoid pulling the 526 MB GPU wheel from PyPI.
-# sentence-transformers depends on torch; if torch is already present pip won't
-# re-download it when processing requirements.txt.
-RUN pip install --no-cache-dir \
-    torch --extra-index-url https://download.pytorch.org/whl/cpu
+# CPU-only torch first, so sentence-transformers doesn't pull the multi-GB CUDA build.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
-# Install remaining dependencies (layer-cached unless requirements.txt changes)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source
+# Bake the embedding model into the image: no download at runtime, faster cold starts.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+
 COPY app/ ./app/
 
-# Expose FastAPI port
 EXPOSE 8000
 
-# Run uvicorn; host 0.0.0.0 makes it reachable from outside the container
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Render (and other hosts) inject $PORT; default to 8000 locally.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
