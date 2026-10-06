@@ -1,281 +1,207 @@
 """
-tools.py — four LangChain @tool-decorated retrieval functions.
+tools.py — the three LangChain tools the agent can call.
 
-plain_rag_lookup          — semantic search over 'sessions' collection, top 5
-participant_filtered_lookup — semantic search + participant post-filter, top 5
-message_pinpoint          — semantic search over 'messages' collection, top 3
-date_range_lookup         — metadata filter on 'sessions' by date range (no vector search)
+    search_sessions          — semantic search over conversation sessions, with
+                               optional sender and date-range filters (combined)
+    message_pinpoint         — semantic search over single messages
+    resolve_date_reference   — deterministic relative-date resolution
 
-All tools return a JSON string so the LLM composer can parse and cite them.
+Each tool uses response_format="content_and_artifact":
+    content  → compact text the agent model reads to decide what to do next
+    artifact → structured data (messages / date result) the composer uses to
+               build citations, so citations always come from real messages.
+
+The docstrings are what the model reads to choose a tool — keep them precise.
 """
 
 from __future__ import annotations
 
+import difflib
 import json
+from datetime import date, datetime, time
+from typing import Optional
 
 from langchain_core.tools import tool
 
-from app.retrieval.vector_store import get_messages_store, get_sessions_store
+from app.core import dedup
+from app.core.dates import resolve_date_reference_impl
+from app.retrieval import vector_store
 
-
-def _docs_to_json(docs) -> str:
-    """Serialize a list of LangChain Documents to a JSON string."""
-    return json.dumps(
-        [{"text": d.page_content, "metadata": d.metadata} for d in docs],
-        ensure_ascii=False,
-        default=str,
-    )
+RETRIEVAL_TOOLS = ("search_sessions", "message_pinpoint")
+_NULLISH = {"", "null", "none", "n/a", "na", "any", "all", "anyone", "everyone", "unknown"}
 
 
 # ---------------------------------------------------------------------------
-# Tool 1 — General semantic search over sessions
+# Argument helpers
 # ---------------------------------------------------------------------------
 
-@tool
-def plain_rag_lookup(question: str) -> str:
-    """Search the WhatsApp chat sessions for content semantically related to the question.
-
-    Use this for general questions that do not mention a specific sender or a
-    specific date/time period.  Returns the top 5 most relevant session chunks.
-    """
-    store = get_sessions_store()
-    docs = store.similarity_search(question, k=5)
-    if not docs:
-        return json.dumps({"message": "No relevant sessions found."})
-    return _docs_to_json(docs)
+def clean_arg(value) -> str | None:
+    """Models sometimes send 'null' / '' / 'None' for an omitted optional arg."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    return None if s.lower() in _NULLISH else s
 
 
-# ---------------------------------------------------------------------------
-# Tool 2 — Participant-filtered semantic search
-# ---------------------------------------------------------------------------
+def resolve_senders(name: str, participants: list[str]) -> list[str]:
+    """Map a name from the question onto the exact participant names.
 
-@tool
-def participant_filtered_lookup(question: str, sender: str) -> str:
-    """Search the WhatsApp chat for sessions that involve a specific participant.
-
-    Use this when the question asks about what a specific person said or did.
-    'sender' should be the contact name as it appears in the chat.
-
-    NOTE: Chroma does not support $contains substring filtering on string
-    metadata fields.  We therefore fetch the top-20 sessions by semantic
-    similarity and post-filter in Python to keep only chunks whose 'participants'
-    field contains the requested sender (case-insensitive).
-    """
-    store = get_sessions_store()
-    # Fetch a wider net to account for the post-filter loss
-    docs = store.similarity_search(question, k=20)
-    filtered = [
-        d for d in docs
-        if sender.lower() in d.metadata.get("participants", "").lower()
-    ]
-    if not filtered:
-        return json.dumps(
-            {"message": f"No sessions found involving participant '{sender}'."}
-        )
-    return _docs_to_json(filtered[:5])
+    exact (case-insensitive) → substring → all words present → fuzzy.
+    May return several names (e.g. 'Arathi' when two Arathis exist)."""
+    n = " ".join(name.lower().split())
+    if not n or not participants:
+        return []
+    lower = {p: p.lower() for p in participants}
+    exact = [p for p, pl in lower.items() if pl == n]
+    if exact:
+        return exact
+    contains = [p for p, pl in lower.items() if n in pl or pl in n]
+    if contains:
+        return contains
+    words = n.split()
+    all_words = [p for p, pl in lower.items() if all(w in pl.split() for w in words)]
+    if all_words:
+        return all_words
+    # Fuzzy: compare against full names and against each name's first word.
+    first_words = {p: pl.split()[0] for p, pl in lower.items() if pl.split()}
+    close = difflib.get_close_matches(n, list(lower.values()), n=3, cutoff=0.8)
+    close_first = difflib.get_close_matches(words[0], list(first_words.values()), n=3, cutoff=0.8)
+    return [p for p in participants if lower[p] in close or first_words.get(p) in close_first]
 
 
-# ---------------------------------------------------------------------------
-# Tool 3 — Message-level pinpoint search
-# ---------------------------------------------------------------------------
-
-@tool
-def message_pinpoint(question: str) -> str:
-    """Find the single most precise individual WhatsApp message relevant to the question.
-
-    Use this when the user is looking for one specific message, quote, or fact
-    rather than a whole conversation thread.  Returns the top 3 matching messages
-    from the 'messages' collection with their exact timestamp and sender.
-    """
-    store = get_messages_store()
-    docs = store.similarity_search(question, k=3)
-    if not docs:
-        return json.dumps({"message": "No matching messages found."})
-    return _docs_to_json(docs)
-
-
-# ---------------------------------------------------------------------------
-# Tool 4 — Date-range session retrieval
-# ---------------------------------------------------------------------------
-
-@tool
-def date_range_lookup(start_date: str, end_date: str) -> str:
-    """Retrieve all WhatsApp conversation sessions that started within a date range.
-
-    Use this when the question mentions specific dates, days, or a time period
-    (e.g. 'last Monday', 'between 9 May and 12 May').
-
-    Args:
-        start_date: ISO date string, YYYY-MM-DD (inclusive).
-        end_date:   ISO date string, YYYY-MM-DD (inclusive).
-
-    Uses Chroma metadata filtering on 'start_ts' (ISO datetime strings are
-    lexicographically comparable, so $gte / $lte work correctly).
-    """
-    store = get_sessions_store()
+def parse_date_arg(value: str | None, end_of_day: bool = False) -> datetime | None:
+    """'YYYY-MM-DD' (or anything dateparser understands, day-first) → datetime."""
+    s = clean_arg(value)
+    if not s:
+        return None
+    d: date | None = None
     try:
-        # Access the underlying chromadb Collection directly for a pure
-        # metadata-filter fetch (no embedding / similarity score needed here).
-        results = store._collection.get(
-            where={
-                "$and": [
-                    {"start_ts": {"$gte": start_date}},
-                    {"start_ts": {"$lte": end_date + "T23:59:59"}},
-                ]
-            },
-            include=["documents", "metadatas"],
-        )
-        documents = results.get("documents") or []
-        metadatas = results.get("metadatas") or []
-        if not documents:
-            return json.dumps(
-                {"message": f"No sessions found between {start_date} and {end_date}."}
-            )
-        combined = [
-            {"text": doc, "metadata": meta}
-            for doc, meta in zip(documents, metadatas)
-        ]
-        return json.dumps(combined, ensure_ascii=False, default=str)
-    except Exception as exc:
-        return json.dumps({"error": str(exc)})
+        d = date.fromisoformat(s[:10])
+    except ValueError:
+        import dateparser
+
+        parsed = dateparser.parse(s, settings={"DATE_ORDER": "DMY"})
+        d = parsed.date() if parsed else None
+    if d is None:
+        return None
+    return datetime.combine(d, time(23, 59, 59) if end_of_day else time(0, 0))
+
+
+_PREVIEW_CHARS = 220
+
+
+def _line(m: dict) -> str:
+    """One-line preview for the agent (the composer later sees full text)."""
+    text = " ".join(m["text"].split())
+    if len(text) > _PREVIEW_CHARS:
+        text = text[: _PREVIEW_CHARS - 1] + "…"
+    return f"[{m['timestamp'][:16].replace('T', ' ')}] {m['sender']}: {text}"
+
+
+def _participants() -> list[str]:
+    return dedup.get_stats()["participants"]
 
 
 # ---------------------------------------------------------------------------
-# Tool 5 — Relative Date Resolution
+# Tool 1 — session search (plain / participant / date-range in one tool)
 # ---------------------------------------------------------------------------
 
-import re
-from datetime import datetime
-import dateparser
+@tool(response_format="content_and_artifact")
+def search_sessions(
+    question: str,
+    sender: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    """Search the chat's conversation sessions (bursts of back-and-forth messages).
 
-
-def resolve_date_reference_impl(reference_text: str, message_timestamp: str) -> dict:
-    """Pure deterministic helper for resolving relative date references."""
-    # Parse base timestamp from the message
-    base_dt = None
-    if isinstance(message_timestamp, str):
-        # Try standard formats
-        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-            try:
-                base_dt = datetime.strptime(message_timestamp.strip(), fmt)
-                break
-            except ValueError:
-                continue
-
-    if base_dt is None:
-        try:
-            base_dt = datetime.fromisoformat(str(message_timestamp).strip())
-        except Exception:
-            base_dt = dateparser.parse(str(message_timestamp)) or datetime.now()
-
-    # Parse relative phrase with RELATIVE_BASE = base_dt
-    clean_text = reference_text.strip()
-    prefer = "past" if re.search(r"\blast\b", clean_text, re.IGNORECASE) else "future"
-    parsed_text = re.sub(r"\b(next|this|last)\b\s*", "", clean_text, flags=re.IGNORECASE)
-
-    resolved_dt = dateparser.parse(
-        parsed_text if parsed_text else clean_text,
-        settings={"RELATIVE_BASE": base_dt, "PREFER_DATES_FROM": prefer},
-    )
-    if not resolved_dt:
-        resolved_dt = dateparser.parse(
-            clean_text,
-            settings={"RELATIVE_BASE": base_dt, "PREFER_DATES_FROM": prefer},
-        )
-
-    if not resolved_dt:
-        return {
-            "status": "error",
-            "error": f"Could not resolve relative date '{reference_text}'",
-        }
-
-    now = datetime.now()
-    today_date = now.date()
-    resolved_date = resolved_dt.date()
-    delta_days = (resolved_date - today_date).days
-
-    if delta_days > 0:
-        status = "upcoming"
-        delta_description = f"{delta_days} day{'s' if delta_days > 1 else ''} from now"
-    elif delta_days < 0:
-        status = "past"
-        abs_days = abs(delta_days)
-        delta_description = f"{abs_days} day{'s' if abs_days > 1 else ''} ago"
-    else:
-        status = "today"
-        delta_description = "today"
-
-    return {
-        "resolved_date": resolved_date.strftime("%Y-%m-%d"),
-        "reference_timestamp": base_dt.strftime("%Y-%m-%d %H:%M"),
-        "today": today_date.strftime("%Y-%m-%d"),
-        "status": status,
-        "delta_description": delta_description,
-    }
-
-
-_RELATIVE_DATE_PAT = re.compile(
-    r"\b(next|this|last)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month|year)\b|\b(tomorrow|yesterday)\b",
-    re.IGNORECASE,
-)
-
-
-def resolve_relative_dates_in_context(raw_results: str) -> str:
-    """Scan retrieved context for candidate relative-date phrases and resolve them."""
-    if not raw_results:
-        return ""
-
-    resolved_notes: list[str] = []
-
-    lines = raw_results.splitlines()
-    for line in lines:
-        matches = _RELATIVE_DATE_PAT.findall(line)
-        if not matches:
-            continue
-
-        # Look for timestamp in format [YYYY-MM-DD HH:MM] or ISO string
-        ts_match = re.search(r"\[?(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\]?", line)
-        ts_str = ts_match.group(1) if ts_match else None
-
-        if not ts_str:
-            iso_match = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", line)
-            ts_str = iso_match.group(1) if iso_match else None
-
-        if not ts_str:
-            continue
-
-        for m in matches:
-            phrase = " ".join([part for part in m if part]).strip()
-            if not phrase:
-                continue
-
-            res = resolve_date_reference_impl(phrase, ts_str)
-            if res.get("status") != "error":
-                note = (
-                    f"- In message at '{ts_str}', relative phrase '{phrase}' resolves to "
-                    f"absolute date {res['resolved_date']} (Status: {res['status']}, {res['delta_description']} relative to today {res['today']})."
-                )
-                if note not in resolved_notes:
-                    resolved_notes.append(note)
-
-    if resolved_notes:
-        return "\n\nResolved Date Information:\n" + "\n".join(resolved_notes)
-    return ""
-
-
-@tool
-def resolve_date_reference(reference_text: str, message_timestamp: str) -> dict:
-    """Resolve a relative date phrase (e.g. 'next Friday', 'tomorrow', 'last Tuesday')
-    relative to a specific message timestamp into an absolute calendar date (YYYY-MM-DD)
-    and compute whether it is upcoming, today, or in the past relative to today's date.
-
-    Args:
-        reference_text: The relative time phrase, e.g. 'next Friday'.
-        message_timestamp: The timestamp of the message, e.g. '2026-05-09 17:37'.
-
-    Returns:
-        dict with keys: resolved_date, reference_timestamp, today, status, delta_description.
+    Use this for most questions: general questions, "what did X say about Y",
+    "what was decided in June", "what happened between 1 and 15 July".
+    Filters can be combined. Fill them ONLY if the question names them:
+      sender: a participant's name (use the exact name from the participant list).
+      start_date / end_date: YYYY-MM-DD, inclusive. For a single day use the same date twice.
+    Returns the best matching sessions with every message's timestamp and sender.
     """
-    return resolve_date_reference_impl(reference_text, message_timestamp)
+    filters = {"sender": None, "start_date": None, "end_date": None}
+    senders: list[str] = []
+    sender = clean_arg(sender)
+    if sender:
+        participants = _participants()
+        senders = resolve_senders(sender, participants)
+        if not senders:
+            note = (
+                f"No participant matches '{sender}'. Participants are: {', '.join(participants)}. "
+                "Retry with one of these exact names, or without a sender filter."
+            )
+            return note, {"kind": "search_sessions", "filters": {**filters, "sender": sender}, "messages": [], "note": note}
+        filters["sender"] = ", ".join(senders)
+
+    start = parse_date_arg(start_date)
+    end = parse_date_arg(end_date, end_of_day=True)
+    if start and end and start > end:
+        start, end = datetime.combine(end.date(), time(0, 0)), datetime.combine(start.date(), time(23, 59, 59))
+    filters["start_date"] = start.date().isoformat() if start else None
+    filters["end_date"] = end.date().isoformat() if end else None
+
+    sessions = vector_store.search_sessions(question, senders or None, start, end, k=5)
+    messages = [m for s in sessions for m in s["messages"]]
+    artifact = {"kind": "search_sessions", "filters": filters, "messages": messages}
+    if not messages:
+        return "No sessions matched this search and these filters.", artifact
+
+    blocks = []
+    for i, s in enumerate(sessions, 1):
+        header = f"Session {i} ({(s['start_ts'] or '')[:10]}; {', '.join(s['participants'])}):"
+        blocks.append(header + "\n" + "\n".join(_line(m) for m in s["messages"]))
+    return "\n\n".join(blocks), artifact
 
 
+# ---------------------------------------------------------------------------
+# Tool 2 — message pinpoint
+# ---------------------------------------------------------------------------
+
+@tool(response_format="content_and_artifact")
+def message_pinpoint(question: str, sender: Optional[str] = None):
+    """Find ONE specific message. Use only when the user wants to locate a
+    particular message or exact quote, e.g. "find the message where Priya shared
+    the link" or "who said 'see you at 6'". Optionally restrict to a sender
+    (exact participant name). Returns the top matching individual messages.
+    """
+    senders: list[str] = []
+    sender = clean_arg(sender)
+    if sender:
+        senders = resolve_senders(sender, _participants())
+    hits = vector_store.search_messages(question, senders or None, k=5)
+    filters = {"sender": ", ".join(senders) or None, "start_date": None, "end_date": None}
+    if not hits:
+        return "No matching messages found.", {"kind": "message_pinpoint", "filters": filters, "messages": []}
+
+    # A message often only makes sense with its neighbour (a bare link followed
+    # by "Cognizant drive 👆"), so each hit comes with the message before/after.
+    blocks, messages = [], []
+    for i, hit in enumerate(hits, 1):
+        window = vector_store.message_window(hit)
+        lines = [("> " if m["content_hash"] == hit["content_hash"] else "  ") + _line(m) for m in window]
+        blocks.append(f"Match {i}:\n" + "\n".join(lines))
+        messages.extend([hit] + [m for m in window if m["content_hash"] != hit["content_hash"]])
+    return "\n\n".join(blocks), {"kind": "message_pinpoint", "filters": filters, "messages": messages}
+
+
+# ---------------------------------------------------------------------------
+# Tool 3 — deterministic date resolution
+# ---------------------------------------------------------------------------
+
+@tool(response_format="content_and_artifact")
+def resolve_date_reference(reference_text: str, message_timestamp: str):
+    """Turn a relative date like "next Friday" or "tomorrow" into a calendar date,
+    relative to when the message containing it was SENT, then compare it with
+    today: status is upcoming, today or past. Never do this arithmetic yourself.
+      reference_text: the phrase exactly as written, e.g. "next Friday".
+      message_timestamp: the message's timestamp, e.g. "2026-05-09 17:37".
+    """
+    res = resolve_date_reference_impl(reference_text, message_timestamp)
+    return json.dumps(res), {"kind": "date", "result": res}
+
+
+TOOLS = [search_sessions, message_pinpoint, resolve_date_reference]
+TOOL_MAP = {t.name: t for t in TOOLS}

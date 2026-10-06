@@ -1,40 +1,26 @@
 """
-query.py — handles natural-language questions over the stored chat.
-Stage 4: runs the full LangGraph agent (router → run_tool → composer).
+query.py — POST /query: a natural-language question through the LangGraph agent.
 """
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from app.agent.graph import get_graph
+from app.agent.graph import run_query
+from app.api.errors import llm_errors
 
 router = APIRouter()
 
 
 class QueryRequest(BaseModel):
-    question: str
+    question: str = Field(..., max_length=2000)
 
 
 @router.post("/query")
-async def query_chat(request: QueryRequest):
-    """Run a natural-language question through the LangGraph agent.
-
-    Returns a grounded answer with per-claim citations (timestamp + sender)
-    and the retrieval mode that was used.
-
-    If nothing relevant is found the answer field will contain an explicit
-    'not found' message and citations will be empty — never hallucinated output.
-    """
-    if not request.question.strip():
+def query_chat(request: QueryRequest):
+    """Returns {answer, citations[{timestamp, sender, excerpt}], mode_used, filters,
+    tool_calls, found, date_resolutions, trace}.  When nothing relevant is found,
+    found is false, citations is empty and answer is the fixed not-found sentence."""
+    question = request.question.strip()
+    if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    graph = get_graph()
-    try:
-        result = graph.invoke({"question": request.question})
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Agent error: {exc}") from exc
-
-    return {
-        "answer": result.get("answer", "No answer produced."),
-        "citations": result.get("citations", []),
-        "mode_used": result.get("mode_used", "unknown"),
-    }
+    with llm_errors("Answering"):
+        return run_query(question)
